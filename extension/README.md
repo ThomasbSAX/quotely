@@ -2,7 +2,7 @@
 
 **Quotely** is a VS Code extension that suggests relevant citations as you write academic papers in LaTeX or Markdown — powered entirely by your local document collection, with no data sent to the cloud.
 
-![Quotely banner](logo.png)
+![Quotely banner](https://raw.githubusercontent.com/ThomasbSAX/quotely/main/logo.png)
 
 ---
 

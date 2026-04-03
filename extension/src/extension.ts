@@ -656,8 +656,8 @@ async function findPython(): Promise<string | null> {
   for (const cmd of candidates) {
     try {
       const out = await spawnAsync(cmd, ["--version"], ".", true);
-      // Accept Python 3.10+
-      if (/Python 3\.(1[0-9]|[2-9]\d)/.test(out)) return cmd;
+      // Accept Python 3.8+
+      if (/Python 3\.([89]|[1-9]\d)/.test(out)) return cmd;
     } catch { /* try next */ }
   }
   return null;
