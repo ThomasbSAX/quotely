@@ -31,13 +31,14 @@ function backendUrl(): string {
 
 export async function getSuggestions(
   text: string,
-  n: number = 5
+  n: number = 5,
+  workspacePath: string = ""
 ): Promise<CitationResult[]> {
   const url = `${backendUrl()}/suggest`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, n }),
+    body: JSON.stringify({ text, n, workspace_path: workspacePath }),
     signal: AbortSignal.timeout(4000),
   });
   if (!res.ok) {

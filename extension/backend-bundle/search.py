@@ -59,8 +59,10 @@ def _truncate(text: str, max_words: int) -> str:
     return " ".join(words[:max_words]) if len(words) > max_words else text
 
 
-def search(text: str, n: int = 5) -> list[CitationResult]:
-    """Two-stage retrieval: bi-encoder → cross-encoder reranker → top-n citations."""
+def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResult]:
+    """Two-stage retrieval: bi-encoder → cross-encoder reranker → top-n citations.
+    If workspace_path is provided, only papers whose file_path starts with it are returned.
+    """
     model = get_model()
 
     # Clean LaTeX from query before embedding
@@ -72,8 +74,8 @@ def search(text: str, n: int = 5) -> list[CitationResult]:
     if total == 0:
         return []
 
-    # Stage 1: retrieve a wider pool of chunks
-    pool_size = min(n * 10, total)
+    # Fetch a larger pool so we still have n results after workspace filtering
+    pool_size = min(n * 20, total)
     results = col.query(
         query_embeddings=query_embedding,
         n_results=pool_size,
@@ -97,7 +99,6 @@ def search(text: str, n: int = 5) -> list[CitationResult]:
     unique_papers: list[tuple[dict, float, str]] = []
     for chunks in best.values():
         best_meta, best_dist, _ = chunks[0]
-        # Combine top chunks separated by " [...] ", truncated for cross-encoder
         combined = " [...] ".join(c[2] for c in chunks)
         combined = _truncate(combined, _RERANK_MAX_WORDS)
         unique_papers.append((best_meta, best_dist, combined))
@@ -105,7 +106,6 @@ def search(text: str, n: int = 5) -> list[CitationResult]:
     # Stage 2: rerank with cross-encoder
     if len(unique_papers) >= 2:
         reranker = get_reranker()
-        # Include title as leading context for the reranker
         pairs = [
             (clean_text, f"{meta['title']}. {context}")
             for meta, _, context in unique_papers
@@ -121,6 +121,18 @@ def search(text: str, n: int = 5) -> list[CitationResult]:
     else:
         ordered = unique_papers
         scores_norm = [round(1 - dist, 4) for _, dist, _ in unique_papers]
+
+    # Filter to workspace if provided
+    if workspace_path:
+        filtered = [
+            (paper, score)
+            for paper, score in zip(ordered, scores_norm)
+            if paper[0].get("file_path", "").startswith(workspace_path)
+        ]
+        # Fall back to all results if workspace has nothing indexed yet
+        if filtered:
+            ordered = [p for p, _ in filtered]
+            scores_norm = [s for _, s in filtered]
 
     citations: list[CitationResult] = []
     for (meta, _, _), score in zip(ordered[:n], scores_norm[:n]):

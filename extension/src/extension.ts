@@ -44,6 +44,12 @@ export async function activate(context: vscode.ExtensionContext) {
   await decorationProvider.refresh();
   setInterval(() => decorationProvider.refresh(), 30000);
 
+  // Auto-index current workspace on activation + when workspace changes
+  autoIndexWorkspace(context);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => autoIndexWorkspace(context))
+  );
+
   // [n] superscript badges on \cite{KEY} — created once, disposed on deactivate
   citationDecorationType = vscode.window.createTextEditorDecorationType({
     color: new vscode.ThemeColor("textLink.foreground"),
@@ -131,7 +137,7 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         results = await searchDocuments(query, mode.value, 30);
       } catch {
-        vscode.window.showErrorMessage("Quotely: backend hors ligne — lance bash start.sh");
+        await showBackendOffline();
         return;
       }
 
@@ -183,9 +189,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
       let citations;
       try {
-        citations = await getSuggestions(contextText, 8);
+        citations = await getSuggestions(contextText, 8, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "");
       } catch {
-        vscode.window.showErrorMessage("Quotely: backend hors ligne — lance bash start.sh");
+        await showBackendOffline();
         return;
       }
 
@@ -242,7 +248,7 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         allPapers = await listPapers();
       } catch {
-        vscode.window.showErrorMessage("Quotely: backend hors ligne — lance bash start.sh");
+        await showBackendOffline();
         return;
       }
 
@@ -274,9 +280,7 @@ export async function activate(context: vscode.ExtensionContext) {
       try {
         papers = await listPapers();
       } catch {
-        vscode.window.showErrorMessage(
-          "Quotely: Backend unreachable. Is the server running?"
-        );
+        await showBackendOffline();
         return;
       }
 
@@ -388,6 +392,26 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Command: re-run setup / repair backend
+  context.subscriptions.push(
+    vscode.commands.registerCommand("quotely.setup", async () => {
+      const projectPath = await ensureProjectPath(context);
+      if (projectPath) {
+        await startBackendIfOffline(projectPath);
+        const healthy = await checkHealth();
+        if (healthy) {
+          vscode.window.showInformationMessage("Quotely: backend is running ✓");
+          await updateStatusBar();
+          await decorationProvider.refresh();
+        } else {
+          vscode.window.showWarningMessage(
+            "Quotely: setup done but backend not yet reachable — it may still be loading (up to 20s)."
+          );
+        }
+      }
+    })
+  );
+
   console.log("[Quotely] Extension activated.");
 }
 
@@ -448,12 +472,25 @@ async function updateStatusBar() {
   if (healthy) {
     statusBarItem.text = "$(book) Quotely ✓";
     statusBarItem.backgroundColor = undefined;
+    statusBarItem.tooltip = "Quotely: backend running — click to list papers";
   } else {
     statusBarItem.text = "$(book) Quotely ✗";
     statusBarItem.backgroundColor = new vscode.ThemeColor(
       "statusBarItem.warningBackground"
     );
-    statusBarItem.tooltip = "Quotely: Backend offline";
+    statusBarItem.tooltip = "Quotely: backend offline — click for setup";
+    statusBarItem.command = "quotely.setup";
+  }
+}
+
+async function showBackendOffline(): Promise<void> {
+  const action = await vscode.window.showErrorMessage(
+    "Quotely: backend offline. Run setup or wait for it to start.",
+    "Setup / Repair",
+    "Dismiss"
+  );
+  if (action === "Setup / Repair") {
+    await vscode.commands.executeCommand("quotely.setup");
   }
 }
 
@@ -537,6 +574,65 @@ function insertBibliographyBlock(
     `Quotely: ${papers.length} bibliography entries inserted.`
   );
 }
+
+// ---------------------------------------------------------------------------
+// Workspace auto-indexing
+// ---------------------------------------------------------------------------
+
+const INDEXED_WORKSPACES_KEY = "quotely.indexedWorkspaces";
+
+/**
+ * Auto-index all supported documents in the current workspace folder.
+ * Runs silently in the background. Skips workspaces already indexed.
+ */
+async function autoIndexWorkspace(context: vscode.ExtensionContext): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) return;
+
+  const healthy = await checkHealth();
+  if (!healthy) return;
+
+  const indexed: string[] = context.globalState.get<string[]>(INDEXED_WORKSPACES_KEY, []);
+
+  for (const folder of folders) {
+    const folderPath = folder.uri.fsPath;
+    if (indexed.includes(folderPath)) continue;
+
+    // Check if folder has any supported files before calling the backend
+    const hasDocs = fs.readdirSync(folderPath).some((f) => {
+      const ext = path.extname(f).toLowerCase();
+      return SUPPORTED_DOC_EXTENSIONS.has(ext);
+    });
+    if (!hasDocs) {
+      // Also check one level deep
+      const subDirs = fs.readdirSync(folderPath).filter((f) => {
+        try { return fs.statSync(path.join(folderPath, f)).isDirectory(); } catch { return false; }
+      });
+      const hasDocsDeep = subDirs.some((dir) =>
+        fs.readdirSync(path.join(folderPath, dir)).some((f) =>
+          SUPPORTED_DOC_EXTENSIONS.has(path.extname(f).toLowerCase())
+        )
+      );
+      if (!hasDocsDeep) continue;
+    }
+
+    try {
+      await ingestFolder(folderPath);
+      indexed.push(folderPath);
+      await context.globalState.update(INDEXED_WORKSPACES_KEY, indexed);
+      await decorationProvider.refresh();
+      console.log(`[Quotely] Auto-indexed workspace: ${folderPath}`);
+    } catch {
+      // Backend not ready yet — will retry on next window open
+    }
+  }
+}
+
+const SUPPORTED_DOC_EXTENSIONS = new Set([
+  ".pdf", ".tex", ".docx", ".doc", ".md", ".txt",
+  ".pptx", ".ppt", ".odt", ".rtf", ".xlsx", ".xls", ".csv", ".ipynb",
+  ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
+]);
 
 // ---------------------------------------------------------------------------
 // First-run auto-setup

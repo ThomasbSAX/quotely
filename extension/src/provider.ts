@@ -37,7 +37,8 @@ export class CitationCompletionProvider
 
     let citations: CitationResult[];
     try {
-      citations = await getSuggestions(contextText, maxSuggestions);
+      const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+      citations = await getSuggestions(contextText, maxSuggestions, workspacePath);
     } catch {
       vscode.window.setStatusBarMessage("$(book) Quotely: backend offline", 5000);
       return null;

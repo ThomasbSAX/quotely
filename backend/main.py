@@ -47,7 +47,7 @@ def suggest(req: SuggestRequest):
     if col.count() == 0:
         return SuggestResponse(citations=[])
     try:
-        citations = search(req.text, n=req.n)
+        citations = search(req.text, n=req.n, workspace_path=req.workspace_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return SuggestResponse(citations=citations)

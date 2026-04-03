@@ -4,6 +4,7 @@ from pydantic import BaseModel
 class SuggestRequest(BaseModel):
     text: str
     n: int = 5
+    workspace_path: str = ""  # if set, filter results to this folder
 
 
 class CitationResult(BaseModel):

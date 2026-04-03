@@ -2,13 +2,22 @@
   "name": "quotely",
   "displayName": "Quotely — Smart Citation Autocomplete",
   "description": "Suggests relevant citations inline while writing LaTeX, Markdown or plain text.",
-  "version": "1.2.1",
+  "version": "1.2.4",
   "publisher": "quotely",
-  "repository": { "type": "git", "url": "https://github.com/ThomasbSAX/quotely" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThomasbSAX/quotely"
+  },
   "icon": "logo.png",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -47,6 +56,10 @@
       {
         "command": "quotely.reindex",
         "title": "Quotely: Réindexer tout le corpus"
+      },
+      {
+        "command": "quotely.setup",
+        "title": "Quotely: Setup / Repair Backend"
       }
     ],
     "keybindings": [
