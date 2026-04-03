@@ -1,0 +1,109 @@
+{
+  "name": "quotely",
+  "displayName": "Quotely — Smart Citation Autocomplete",
+  "description": "Suggests relevant citations inline while writing LaTeX, Markdown or plain text.",
+  "version": "1.2.0",
+  "publisher": "quotely",
+  "icon": "logo.png",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quotely.search",
+        "title": "Quotely: Search Documents"
+      },
+      {
+        "command": "quotely.suggest",
+        "title": "Quotely: Suggest Citation Here"
+      },
+      {
+        "command": "quotely.insertBibliography",
+        "title": "Quotely: Insert Bibliography"
+      },
+      {
+        "command": "quotely.openPapersFolder",
+        "title": "Quotely: Open Papers Folder"
+      },
+      {
+        "command": "quotely.listPapers",
+        "title": "Quotely: List Indexed Papers"
+      },
+      {
+        "command": "quotely.openFile",
+        "title": "Quotely: Open Source File"
+      },
+      {
+        "command": "quotely.goToBibEntry",
+        "title": "Quotely: Go to Bibliography Entry"
+      },
+      {
+        "command": "quotely.addFolder",
+        "title": "Quotely: Indexer un dossier"
+      },
+      {
+        "command": "quotely.reindex",
+        "title": "Quotely: Réindexer tout le corpus"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "quotely.search",
+        "key": "ctrl+shift+f",
+        "mac": "cmd+shift+f",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quotely.suggest",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Quotely",
+      "properties": {
+        "quotely.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7331",
+          "description": "URL of the Quotely backend server."
+        },
+        "quotely.contextParagraphs": {
+          "type": "number",
+          "default": 3,
+          "description": "Number of paragraphs to use as context for suggestions."
+        },
+        "quotely.maxSuggestions": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum number of citation suggestions to show."
+        },
+        "quotely.triggerOnCite": {
+          "type": "boolean",
+          "default": true,
+          "description": "Trigger suggestions when typing \\cite{ (LaTeX) or [@ (Pandoc)."
+        },
+        "quotely.projectPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the Quotely project root (set automatically by setup.sh)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "prepackage": "node scripts/copy-backend.js",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}
