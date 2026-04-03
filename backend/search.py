@@ -11,12 +11,10 @@ from __future__ import annotations
 import math
 import re
 
-from sentence_transformers import CrossEncoder
-
 from ingest import get_collection, get_model
 from models import CitationResult
 
-_reranker: CrossEncoder | None = None
+_reranker = None  # CrossEncoder, loaded lazily on first use
 RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 
 # Max words fed to cross-encoder per (query, doc) pair
@@ -25,9 +23,10 @@ _RERANK_MAX_WORDS = 350
 _CHUNKS_PER_PAPER = 2
 
 
-def get_reranker() -> CrossEncoder:
+def get_reranker():
     global _reranker
     if _reranker is None:
+        from sentence_transformers import CrossEncoder  # lazy — avoids PyTorch crash on startup
         print(f"[RagCite] Loading reranker ({RERANKER_MODEL})...")
         _reranker = CrossEncoder(RERANKER_MODEL, device="cpu")
         print("[RagCite] Reranker ready.")

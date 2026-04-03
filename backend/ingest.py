@@ -27,7 +27,6 @@ from vector_store import VectorStore
 import fitz  # PyMuPDF
 import pymupdf4llm
 from docx import Document as DocxDocument
-from sentence_transformers import SentenceTransformer
 
 # Optional OCR dependencies
 try:
@@ -61,7 +60,7 @@ _SOFFICE = shutil.which("soffice") or "/opt/homebrew/bin/soffice"
 LIBREOFFICE_AVAILABLE = Path(_SOFFICE).exists() if _SOFFICE else False
 
 _collection: VectorStore | None = None
-_model: SentenceTransformer | None = None
+_model = None  # SentenceTransformer, loaded lazily on first use
 
 CHUNK_SIZE = 300   # tokens approx (we use words as proxy)
 CHUNK_OVERLAP = 50
@@ -74,9 +73,10 @@ def get_collection() -> VectorStore:
     return _collection
 
 
-def get_model() -> SentenceTransformer:
+def get_model():
     global _model
     if _model is None:
+        from sentence_transformers import SentenceTransformer  # lazy — avoids PyTorch crash on startup
         print("[RagCite] Loading embedding model (first time ~15s)...")
         _model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         print("[RagCite] Model ready.")
