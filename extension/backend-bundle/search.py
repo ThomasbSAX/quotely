@@ -29,7 +29,7 @@ def get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is None:
         print(f"[RagCite] Loading reranker ({RERANKER_MODEL})...")
-        _reranker = CrossEncoder(RERANKER_MODEL)
+        _reranker = CrossEncoder(RERANKER_MODEL, device="cpu")
         print("[RagCite] Reranker ready.")
     return _reranker
 

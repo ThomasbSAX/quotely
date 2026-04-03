@@ -218,9 +218,7 @@ def ingest_folder(req: FolderIngestRequest):
 def reindex_all():
     """Clear the vector DB and re-index everything from DATA_PATH (fresh embeddings)."""
     col = get_collection()
-    all_ids = col.get(include=[])["ids"]
-    if all_ids:
-        col.delete(ids=all_ids)
+    col.reset()
 
     total = 0
     errors: list[str] = []

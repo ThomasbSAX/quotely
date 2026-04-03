@@ -1,5 +1,5 @@
 """
-Document ingestion pipeline: PDF / TEX / DOCX / TXT / PPTX / XLSX / CSV / Images → ChromaDB
+Document ingestion pipeline: PDF / TEX / DOCX / TXT / PPTX / XLSX / CSV / Images → VectorStore
 
 Extraction layers:
   1. .tex  → parse LaTeX source directly (perfect math, zero loss)
@@ -11,6 +11,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -18,7 +19,11 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
-import chromadb
+# Force PyTorch to CPU — avoids SIGSEGV from MPS/Metal init on macOS 26 beta
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+from vector_store import VectorStore
 import fitz  # PyMuPDF
 import pymupdf4llm
 from docx import Document as DocxDocument
@@ -55,28 +60,17 @@ PAPERS_PATH = DATA_PATH / "papers"                          # kept for backwards
 _SOFFICE = shutil.which("soffice") or "/opt/homebrew/bin/soffice"
 LIBREOFFICE_AVAILABLE = Path(_SOFFICE).exists() if _SOFFICE else False
 
-_client: chromadb.PersistentClient | None = None
-_collection: chromadb.Collection | None = None
+_collection: VectorStore | None = None
 _model: SentenceTransformer | None = None
 
 CHUNK_SIZE = 300   # tokens approx (we use words as proxy)
 CHUNK_OVERLAP = 50
 
 
-def get_client() -> chromadb.PersistentClient:
-    global _client
-    if _client is None:
-        _client = chromadb.PersistentClient(path=str(DB_PATH))
-    return _client
-
-
-def get_collection() -> chromadb.Collection:
+def get_collection() -> VectorStore:
     global _collection
     if _collection is None:
-        _collection = get_client().get_or_create_collection(
-            name="papers",
-            metadata={"hnsw:space": "cosine"},
-        )
+        _collection = VectorStore(DB_PATH / "vectors.pkl")
     return _collection
 
 
@@ -84,7 +78,7 @@ def get_model() -> SentenceTransformer:
     global _model
     if _model is None:
         print("[RagCite] Loading embedding model (first time ~15s)...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        _model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         print("[RagCite] Model ready.")
     return _model
 
