@@ -2,6 +2,7 @@
 RagCite FastAPI backend — port 7331
 """
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,12 +17,25 @@ from search import search
 from watcher import index_existing_papers, start_watcher
 
 
+def _prewarm_models() -> None:
+    """Download/cache ONNX models on startup so the first query has no cold-start delay."""
+    try:
+        from ingest import get_model
+        get_model()
+        from search import get_reranker
+        get_reranker()
+        print("[RagCite] Models pre-warmed and ready.")
+    except Exception as e:
+        print(f"[RagCite] Model pre-warm warning: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # On startup: index existing papers + start watcher
+    # On startup: index existing papers + start watcher + pre-warm models
     print("[RagCite] Indexing existing papers...")
     index_existing_papers()
     start_watcher()
+    threading.Thread(target=_prewarm_models, daemon=True).start()
     yield
 
 
@@ -70,6 +84,7 @@ async def ingest_upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    get_collection().save()
     return IngestResponse(
         status="ok",
         bibtex_key=result["bibtex_key"],
@@ -211,6 +226,7 @@ def ingest_folder(req: FolderIngestRequest):
         except Exception as e:
             errors.append(f"{p.name}: {e}")
 
+    get_collection().save()
     return FolderIngestResult(indexed=indexed, skipped=skipped, errors=errors)
 
 
@@ -236,6 +252,7 @@ def reindex_all():
         except Exception as e:
             errors.append(f"{p.name}: {e}")
 
+    get_collection().save()
     return ReindexResult(total=total, errors=errors)
 
 

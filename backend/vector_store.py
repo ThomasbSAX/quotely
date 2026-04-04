@@ -8,6 +8,7 @@ Persistence: single pickle file at data/db/vectors.pkl
 from __future__ import annotations
 
 import pickle
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ import numpy as np
 class VectorStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._lock = threading.RLock()
         self._ids:        list[str]        = []
         self._embeddings: list[list[float]] = []
         self._documents:  list[str]        = []
@@ -67,50 +69,59 @@ class VectorStore:
         documents:  list[str],
         metadatas:  list[dict],
     ) -> None:
-        id_index = {id_: i for i, id_ in enumerate(self._ids)}
-        for id_, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
-            if id_ in id_index:
-                idx = id_index[id_]
-                self._embeddings[idx] = emb
-                self._documents[idx]  = doc
-                self._metadatas[idx]  = meta
-            else:
-                id_index[id_] = len(self._ids)
-                self._ids.append(id_)
-                self._embeddings.append(emb)
-                self._documents.append(doc)
-                self._metadatas.append(meta)
-        self._save()
+        with self._lock:
+            id_index = {id_: i for i, id_ in enumerate(self._ids)}
+            for id_, emb, doc, meta in zip(ids, embeddings, documents, metadatas):
+                if id_ in id_index:
+                    idx = id_index[id_]
+                    self._embeddings[idx] = emb
+                    self._documents[idx]  = doc
+                    self._metadatas[idx]  = meta
+                else:
+                    id_index[id_] = len(self._ids)
+                    self._ids.append(id_)
+                    self._embeddings.append(emb)
+                    self._documents.append(doc)
+                    self._metadatas.append(meta)
+            # Note: caller must call save() to persist to disk
+
+    def save(self) -> None:
+        """Persist current state to disk. Call after batch upserts."""
+        with self._lock:
+            self._save()
 
     def delete(
         self,
         where: dict | None = None,
         ids:   list[str] | None = None,
     ) -> None:
-        if ids is not None:
-            drop = set(ids)
-            keep = [i for i, id_ in enumerate(self._ids) if id_ not in drop]
-        elif where:
-            key, value = next(iter(where.items()))
-            keep = [i for i, m in enumerate(self._metadatas) if m.get(key) != value]
-        else:
-            keep = []
-        self._ids        = [self._ids[i]        for i in keep]
-        self._embeddings = [self._embeddings[i] for i in keep]
-        self._documents  = [self._documents[i]  for i in keep]
-        self._metadatas  = [self._metadatas[i]  for i in keep]
-        self._save()
+        with self._lock:
+            if ids is not None:
+                drop = set(ids)
+                keep = [i for i, id_ in enumerate(self._ids) if id_ not in drop]
+            elif where:
+                key, value = next(iter(where.items()))
+                keep = [i for i, m in enumerate(self._metadatas) if m.get(key) != value]
+            else:
+                keep = []
+            self._ids        = [self._ids[i]        for i in keep]
+            self._embeddings = [self._embeddings[i] for i in keep]
+            self._documents  = [self._documents[i]  for i in keep]
+            self._metadatas  = [self._metadatas[i]  for i in keep]
+            self._save()
 
     def reset(self) -> None:
-        self._reset_data()
-        self._save()
+        with self._lock:
+            self._reset_data()
+            self._save()
 
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
     def count(self) -> int:
-        return len(self._ids)
+        with self._lock:
+            return len(self._ids)
 
     def get(
         self,
@@ -119,33 +130,34 @@ class VectorStore:
         limit:          int  | None = None,
         include:        list | None = None,
     ) -> dict:
-        indices = list(range(len(self._ids)))
+        with self._lock:
+            indices = list(range(len(self._ids)))
 
-        # Filter by metadata field
-        if where:
-            key, value = next(iter(where.items()))
-            indices = [i for i in indices if self._metadatas[i].get(key) == value]
+            # Filter by metadata field
+            if where:
+                key, value = next(iter(where.items()))
+                indices = [i for i in indices if self._metadatas[i].get(key) == value]
 
-        # Filter by document full-text substring
-        if where_document and "$contains" in where_document:
-            needle = where_document["$contains"].lower()
-            indices = [i for i in indices if needle in self._documents[i].lower()]
+            # Filter by document full-text substring
+            if where_document and "$contains" in where_document:
+                needle = where_document["$contains"].lower()
+                indices = [i for i in indices if needle in self._documents[i].lower()]
 
-        if limit is not None:
-            indices = indices[:limit]
+            if limit is not None:
+                indices = indices[:limit]
 
-        result: dict = {"ids": [self._ids[i] for i in indices]}
+            result: dict = {"ids": [self._ids[i] for i in indices]}
 
-        # include=[] means "ids only"; include=None means "all"
-        want_meta = include is None or "metadatas" in include
-        want_docs = include is None or "documents" in include
+            # include=[] means "ids only"; include=None means "all"
+            want_meta = include is None or "metadatas" in include
+            want_docs = include is None or "documents" in include
 
-        if want_meta:
-            result["metadatas"] = [self._metadatas[i] for i in indices]
-        if want_docs:
-            result["documents"] = [self._documents[i] for i in indices]
+            if want_meta:
+                result["metadatas"] = [self._metadatas[i] for i in indices]
+            if want_docs:
+                result["documents"] = [self._documents[i] for i in indices]
 
-        return result
+            return result
 
     def query(
         self,
@@ -153,22 +165,23 @@ class VectorStore:
         n_results:        int       = 10,
         include:          list[str] | None = None,
     ) -> dict:
-        if not self._embeddings:
-            return {"metadatas": [[]], "distances": [[]], "documents": [[]]}
+        with self._lock:
+            if not self._embeddings:
+                return {"metadatas": [[]], "distances": [[]], "documents": [[]]}
 
-        query_vec  = np.array(query_embeddings[0], dtype=np.float32)
-        emb_matrix = np.array(self._embeddings,    dtype=np.float32)
+            query_vec  = np.array(query_embeddings[0], dtype=np.float32)
+            emb_matrix = np.array(self._embeddings,    dtype=np.float32)
 
-        # Cosine similarity (normalised dot product)
-        query_norm  = query_vec  / (np.linalg.norm(query_vec)                              + 1e-8)
-        emb_norms   = np.linalg.norm(emb_matrix, axis=1, keepdims=True) + 1e-8
-        similarities = (emb_matrix / emb_norms) @ query_norm
+            # Cosine similarity (normalised dot product)
+            query_norm  = query_vec  / (np.linalg.norm(query_vec)                              + 1e-8)
+            emb_norms   = np.linalg.norm(emb_matrix, axis=1, keepdims=True) + 1e-8
+            similarities = (emb_matrix / emb_norms) @ query_norm
 
-        top_k   = min(n_results, len(self._ids))
-        top_idx = np.argsort(similarities)[::-1][:top_k]
+            top_k   = min(n_results, len(self._ids))
+            top_idx = np.argsort(similarities)[::-1][:top_k]
 
-        return {
-            "metadatas": [[self._metadatas[i] for i in top_idx]],
-            "distances":  [[float(1.0 - similarities[i]) for i in top_idx]],
-            "documents":  [[self._documents[i]  for i in top_idx]],
-        }
+            return {
+                "metadatas": [[self._metadatas[i] for i in top_idx]],
+                "distances":  [[float(1.0 - similarities[i]) for i in top_idx]],
+                "documents":  [[self._documents[i]  for i in top_idx]],
+            }

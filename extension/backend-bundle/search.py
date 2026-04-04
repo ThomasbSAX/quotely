@@ -1,10 +1,6 @@
 """
-Semantic search: bi-encoder retrieval + cross-encoder reranker (2-stage pipeline)
-
-Improvements over baseline:
-- Query cleaning: LaTeX commands stripped before embedding
-- Multi-chunk context: top-2 chunks per paper concatenated for reranker
-- Wider pool: n×10 candidates before deduplication
+Semantic search: bi-encoder retrieval + optional cross-encoder reranker.
+Both models use fastembed (ONNX) — no PyTorch, no GPU required.
 """
 from __future__ import annotations
 
@@ -14,41 +10,32 @@ import re
 from ingest import get_collection, get_model
 from models import CitationResult
 
-_reranker = None  # CrossEncoder, loaded lazily on first use
-RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
-
-# Max words fed to cross-encoder per (query, doc) pair
+_reranker = None          # TextCrossEncoder, loaded lazily
+_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _RERANK_MAX_WORDS = 350
-# Max chunks kept per paper for building reranker context
 _CHUNKS_PER_PAPER = 2
 
 
 def get_reranker():
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder  # lazy — avoids PyTorch crash on startup
-        print(f"[RagCite] Loading reranker ({RERANKER_MODEL})...")
-        _reranker = CrossEncoder(RERANKER_MODEL, device="cpu")
-        print("[RagCite] Reranker ready.")
-    return _reranker
+        try:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder  # lazy
+            print(f"[RagCite] Loading reranker ({_RERANKER_MODEL})...")
+            _reranker = TextCrossEncoder(_RERANKER_MODEL)
+            print("[RagCite] Reranker ready.")
+        except Exception as e:
+            print(f"[RagCite] Reranker unavailable ({e}), using bi-encoder only.")
+            _reranker = False  # sentinel: reranking disabled
+    return _reranker if _reranker is not False else None
 
 
 def _clean_query(text: str) -> str:
-    """
-    Strip LaTeX markup from the query so the embedding model sees plain text.
-    Keeps mathematical content by preserving $...$ inline math.
-    """
-    # Keep the content of formatting commands
     text = re.sub(r"\\(?:textbf|textit|emph|underline|text)\{([^}]+)\}", r"\1", text)
-    # Remove cite/ref/label commands entirely
     text = re.sub(r"\\(?:cite|ref|label|footnote)\{[^}]*\}", "", text)
-    # Remove environments wrappers (begin/end) but keep their content
     text = re.sub(r"\\(?:begin|end)\{[^}]+\}", "", text)
-    # Remove remaining single-argument commands (figures, includes…)
     text = re.sub(r"\\[a-zA-Z]+\*?\{[^}]*\}", "", text)
-    # Remove standalone commands
     text = re.sub(r"\\[a-zA-Z]+\*?", "", text)
-    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -59,21 +46,18 @@ def _truncate(text: str, max_words: int) -> str:
 
 
 def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResult]:
-    """Two-stage retrieval: bi-encoder → cross-encoder reranker → top-n citations.
-    If workspace_path is provided, only papers whose file_path starts with it are returned.
-    """
+    """Two-stage retrieval: bi-encoder (ONNX) → optional cross-encoder reranker (ONNX)."""
     model = get_model()
-
-    # Clean LaTeX from query before embedding
     clean_text = _clean_query(text)
-    query_embedding = model.encode([clean_text], show_progress_bar=False).tolist()
+
+    # fastembed: embed() returns a generator of numpy arrays
+    query_embedding = [next(model.embed([clean_text])).tolist()]
 
     col = get_collection()
     total = col.count()
     if total == 0:
         return []
 
-    # Fetch a larger pool so we still have n results after workspace filtering
     pool_size = min(n * 20, total)
     results = col.query(
         query_embeddings=query_embedding,
@@ -85,7 +69,7 @@ def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResu
     distances = results["distances"][0]
     documents = results["documents"][0]
 
-    # Deduplicate: keep best N chunks per paper for richer reranker context
+    # Deduplicate: keep top-2 chunks per paper for richer reranker context
     best: dict[str, list[tuple[dict, float, str]]] = {}
     for meta, dist, doc in zip(metadatas, distances, documents):
         key = meta["bibtex_key"]
@@ -94,7 +78,6 @@ def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResu
         if len(best[key]) < _CHUNKS_PER_PAPER:
             best[key].append((meta, dist, doc))
 
-    # Build per-paper entries: (best_meta, best_dist, combined_context)
     unique_papers: list[tuple[dict, float, str]] = []
     for chunks in best.values():
         best_meta, best_dist, _ = chunks[0]
@@ -102,39 +85,49 @@ def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResu
         combined = _truncate(combined, _RERANK_MAX_WORDS)
         unique_papers.append((best_meta, best_dist, combined))
 
-    # Stage 2: rerank with cross-encoder
-    if len(unique_papers) >= 2:
-        reranker = get_reranker()
-        pairs = [
-            (clean_text, f"{meta['title']}. {context}")
-            for meta, _, context in unique_papers
-        ]
-        reranker_scores = reranker.predict(pairs).tolist()
-        ranked = sorted(
-            zip(unique_papers, reranker_scores),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-        ordered = [item for item, _ in ranked]
-        scores_norm = [round(1 / (1 + math.exp(-s)), 4) for _, s in ranked]
+    # Stage 2: rerank with cross-encoder (ONNX) if available
+    reranker = get_reranker()
+    if reranker is not None and len(unique_papers) >= 2:
+        try:
+            docs_for_rerank = [
+                f"{meta['title']}. {context}"
+                for meta, _, context in unique_papers
+            ]
+            raw = list(reranker.rerank(clean_text, docs_for_rerank))
+            # fastembed reranker returns objects with .score, or plain floats
+            if raw and hasattr(raw[0], "score"):
+                reranker_scores = [r.score for r in raw]
+            else:
+                reranker_scores = [float(r) for r in raw]
+
+            ranked = sorted(
+                zip(unique_papers, reranker_scores),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            unique_papers = [item for item, _ in ranked]
+            scores_norm = [round(1 / (1 + math.exp(-s)), 4) for _, s in ranked]
+        except Exception as e:
+            print(f"[RagCite] Reranker error ({e}), falling back to bi-encoder.")
+            unique_papers.sort(key=lambda x: x[1])
+            scores_norm = [round(max(0.0, 1.0 - dist), 4) for _, dist, _ in unique_papers]
     else:
-        ordered = unique_papers
-        scores_norm = [round(1 - dist, 4) for _, dist, _ in unique_papers]
+        unique_papers.sort(key=lambda x: x[1])
+        scores_norm = [round(max(0.0, 1.0 - dist), 4) for _, dist, _ in unique_papers]
 
     # Filter to workspace if provided
     if workspace_path:
         filtered = [
             (paper, score)
-            for paper, score in zip(ordered, scores_norm)
+            for paper, score in zip(unique_papers, scores_norm)
             if paper[0].get("file_path", "").startswith(workspace_path)
         ]
-        # Fall back to all results if workspace has nothing indexed yet
         if filtered:
-            ordered = [p for p, _ in filtered]
+            unique_papers = [p for p, _ in filtered]
             scores_norm = [s for _, s in filtered]
 
     citations: list[CitationResult] = []
-    for (meta, _, _), score in zip(ordered[:n], scores_norm[:n]):
+    for (meta, _, _), score in zip(unique_papers[:n], scores_norm[:n]):
         citations.append(
             CitationResult(
                 bibtex_key=meta["bibtex_key"],

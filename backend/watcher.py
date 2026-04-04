@@ -9,7 +9,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 from watchdog.observers import Observer
 
-from ingest import ingest_file, is_already_indexed, DATA_PATH, DB_PATH
+from ingest import ingest_file, is_already_indexed, DATA_PATH, DB_PATH, get_collection
 
 SUPPORTED_EXTENSIONS = {
     ".pdf", ".tex", ".docx", ".doc",
@@ -46,6 +46,7 @@ class PapersHandler(FileSystemEventHandler):
                 print(f"[RagCite] Already indexed, skipping: {path.name}")
                 return
             ingest_file(path)
+            get_collection().save()
         except Exception as e:
             print(f"[RagCite] Error ingesting {path.name}: {e}")
 
@@ -79,4 +80,5 @@ def index_existing_papers():
         except Exception as e:
             print(f"[RagCite] Failed to index {path.name}: {e}")
     if count:
+        get_collection().save()
         print(f"[RagCite] Startup indexing complete: {count} new document(s) added.")

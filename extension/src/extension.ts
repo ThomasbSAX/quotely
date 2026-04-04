@@ -14,6 +14,8 @@ let statusBarItem: vscode.StatusBarItem;
 let completionProvider: CitationCompletionProvider;
 let backendProcess: cp.ChildProcess | null = null;
 let decorationProvider: QuotelyDecorationProvider;
+let _lastRestartAttempt = 0;
+const RESTART_COOLDOWN_MS = 60_000;
 
 // TextEditorDecorationType for [n] superscript badges on \cite{KEY}
 let citationDecorationType: vscode.TextEditorDecorationType;
@@ -473,6 +475,7 @@ async function updateStatusBar() {
     statusBarItem.text = "$(book) Quotely ✓";
     statusBarItem.backgroundColor = undefined;
     statusBarItem.tooltip = "Quotely: backend running — click to list papers";
+    statusBarItem.command = "quotely.listPapers";
   } else {
     statusBarItem.text = "$(book) Quotely ✗";
     statusBarItem.backgroundColor = new vscode.ThemeColor(
@@ -480,6 +483,16 @@ async function updateStatusBar() {
     );
     statusBarItem.tooltip = "Quotely: backend offline — click for setup";
     statusBarItem.command = "quotely.setup";
+
+    // Auto-restart with cooldown to avoid restart loops
+    const now = Date.now();
+    if (now - _lastRestartAttempt > RESTART_COOLDOWN_MS) {
+      _lastRestartAttempt = now;
+      const projectPath = vscode.workspace.getConfiguration("quotely").get<string>("projectPath") ?? "";
+      if (projectPath) {
+        await startBackendIfOffline(projectPath);
+      }
+    }
   }
 }
 
@@ -629,8 +642,8 @@ async function autoIndexWorkspace(context: vscode.ExtensionContext): Promise<voi
 }
 
 const SUPPORTED_DOC_EXTENSIONS = new Set([
-  ".pdf", ".tex", ".docx", ".doc", ".md", ".txt",
-  ".pptx", ".ppt", ".odt", ".rtf", ".xlsx", ".xls", ".csv", ".ipynb",
+  ".pdf", ".tex", ".docx", ".md", ".txt",
+  ".pptx", ".xlsx", ".xls", ".csv", ".ipynb",
   ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
 ]);
 

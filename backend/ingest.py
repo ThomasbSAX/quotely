@@ -24,17 +24,24 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from vector_store import VectorStore
-import fitz  # PyMuPDF
-import pymupdf4llm
-from docx import Document as DocxDocument
+# fitz, pymupdf4llm, docx imported lazily inside extraction functions
+# to avoid SIGSEGV on macOS 26 + Python 3.12 during module load
 
-# Optional OCR dependencies
-try:
-    import pytesseract
-    from PIL import Image as PILImage
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
+# Optional OCR dependencies — checked lazily on first use to avoid C-extension
+# crashes at module load time (Pillow is a C extension)
+_ocr_available: bool | None = None  # None = not yet checked
+
+
+def _is_ocr_available() -> bool:
+    global _ocr_available
+    if _ocr_available is None:
+        try:
+            import pytesseract  # noqa: F401
+            from PIL import Image  # noqa: F401
+            _ocr_available = True
+        except ImportError:
+            _ocr_available = False
+    return _ocr_available
 
 # Optional PowerPoint / Excel
 try:
@@ -76,9 +83,9 @@ def get_collection() -> VectorStore:
 def get_model():
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer  # lazy — avoids PyTorch crash on startup
+        from fastembed import TextEmbedding  # lazy — ONNX, no PyTorch
         print("[RagCite] Loading embedding model (first time ~15s)...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        _model = TextEmbedding("intfloat/multilingual-e5-small")
         print("[RagCite] Model ready.")
     return _model
 
@@ -88,6 +95,8 @@ def get_model():
 # ---------------------------------------------------------------------------
 
 def _extract_pdf(path: Path) -> tuple[str, dict]:
+    import fitz  # lazy — C extension, avoid crash on module load
+    import pymupdf4llm
     """
     Primary: pymupdf4llm → markdown with structure + OCR fallback on complex pages.
     Secondary: OCR of embedded images (figures, diagrams).
@@ -104,7 +113,9 @@ def _extract_pdf(path: Path) -> tuple[str, dict]:
 
     # --- OCR of embedded images (figures, diagrams, formula images) ---
     img_texts: list[str] = []
-    if OCR_AVAILABLE:
+    if _is_ocr_available():
+        import pytesseract
+        from PIL import Image as PILImage
         seen_xrefs: set[int] = set()
         for page in doc:
             for img_info in page.get_images(full=True):
@@ -203,6 +214,7 @@ def _extract_tex(path: Path) -> tuple[str, dict]:
 
 
 def _extract_docx(path: Path) -> tuple[str, dict]:
+    from docx import Document as DocxDocument  # lazy — lxml C extension
     doc = DocxDocument(str(path))
     parts = [p.text for p in doc.paragraphs if p.text.strip()]
     for table in doc.tables:
@@ -284,11 +296,13 @@ def _extract_csv(path: Path) -> tuple[str, dict]:
 
 
 def _extract_image(path: Path) -> tuple[str, dict]:
-    if not OCR_AVAILABLE:
+    if not _is_ocr_available():
         raise ImportError(
             "pytesseract/Pillow not installed or Tesseract absent. "
             "Run: brew install tesseract && pip install pytesseract Pillow"
         )
+    import pytesseract
+    from PIL import Image as PILImage
     img = PILImage.open(str(path))
     full_text = pytesseract.image_to_string(img, lang="fra+eng")
     year = _extract_year(full_text[:5000])
@@ -618,7 +632,7 @@ def ingest_file(path: Path) -> dict:
     embed_texts = [f"Titre: {title}\n{chunk}" for chunk in all_chunks]
 
     model = get_model()
-    embeddings = model.encode(embed_texts, show_progress_bar=False).tolist()
+    embeddings = [e.tolist() for e in model.embed(embed_texts, batch_size=256)]
 
     col = get_collection()
     # Title chunk → _title ID; content chunks → _chunk0, _chunk1, …
