@@ -1,13 +1,23 @@
+## Python
 backend/.venv/
-backend/__pycache__/
 **/__pycache__/
 *.pyc
-data/db/
-data/papers/
+*.pyo
+
+## Data (user files — never commit)
+data/
+
+## Evaluation (internal tooling)
+eval/
+
+## VS Code extension
 extension/node_modules/
 extension/out/
 .vscode/
+
+## OS
 *.DS_Store
+
+## Legacy / misc
 lm-studio.txt
-eval/results/
 Capture*

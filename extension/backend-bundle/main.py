@@ -51,8 +51,18 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
+    import os, time
     col = get_collection()
-    return {"status": "ok", "indexed_chunks": col.count()}
+    from ingest import _model as emb_model
+    from search import _reranker
+    return {
+        "status": "ok",
+        "version": "1.0.1",
+        "indexed_chunks": col.count(),
+        "model_loaded": emb_model is not None,
+        "reranker_loaded": _reranker is not None and _reranker is not False,
+        "pid": os.getpid(),
+    }
 
 
 @app.post("/suggest", response_model=SuggestResponse)

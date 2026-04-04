@@ -1,0 +1,19 @@
+# TypeScript source (compiled to out/)
+src/
+
+# Build tooling
+tsconfig.json
+scripts/
+
+# Dev dependencies
+node_modules/
+.vscode/
+
+# Tests (none yet, but exclude if added)
+**/*.test.js
+**/*.spec.js
+
+# Misc
+*.DS_Store
+.eslintrc*
+.prettierrc*
