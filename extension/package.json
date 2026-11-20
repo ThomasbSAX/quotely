@@ -1,0 +1,173 @@
+{
+  "name": "quotely",
+  "displayName": "Quotely — Assistant de citation",
+  "description": "Assistant d'écriture scientifique : retrouve dans ta bibliothèque les passages qui appuient ce que tu écris, insère les citations et tient la bibliographie à jour.",
+  "version": "2.0.0",
+  "publisher": "quotely",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ThomasbSAX/quotely"
+  },
+  "icon": "logo.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "quotely.search",
+        "title": "Quotely: Search Documents"
+      },
+      {
+        "command": "quotely.suggest",
+        "title": "Quotely: Suggest Citation Here"
+      },
+      {
+        "command": "quotely.insertBibliography",
+        "title": "Quotely: Compléter la bibliographie"
+      },
+      {
+        "command": "quotely.openPapersFolder",
+        "title": "Quotely: Open Papers Folder"
+      },
+      {
+        "command": "quotely.listPapers",
+        "title": "Quotely: List Indexed Papers"
+      },
+      {
+        "command": "quotely.openFile",
+        "title": "Quotely: Open Source File"
+      },
+      {
+        "command": "quotely.goToBibEntry",
+        "title": "Quotely: Go to Bibliography Entry"
+      },
+      {
+        "command": "quotely.addFolder",
+        "title": "Quotely: Indexer un dossier"
+      },
+      {
+        "command": "quotely.reindex",
+        "title": "Quotely: Réindexer tout le corpus"
+      },
+      {
+        "command": "quotely.setup",
+        "title": "Quotely: Setup / Repair Backend"
+      },
+      {
+        "command": "quotely.assist.analyze",
+        "title": "Quotely: Analyser tout le document"
+      },
+      {
+        "command": "quotely.assist.list",
+        "title": "Quotely: Voir les sources suggérées"
+      },
+      {
+        "command": "quotely.assist.toggle",
+        "title": "Quotely: Activer / désactiver l'assistant d'écriture"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "quotely.search",
+        "key": "ctrl+shift+f",
+        "mac": "cmd+shift+f",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quotely.suggest",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "quotely.assist.list",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Quotely",
+      "properties": {
+        "quotely.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:7331",
+          "description": "URL of the Quotely backend server."
+        },
+        "quotely.contextParagraphs": {
+          "type": "number",
+          "default": 3,
+          "description": "Number of paragraphs to use as context for suggestions."
+        },
+        "quotely.maxSuggestions": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum number of citation suggestions to show."
+        },
+        "quotely.triggerOnCite": {
+          "type": "boolean",
+          "default": true,
+          "description": "Propose une clé en texte fantôme quand tu tapes \\cite{ (LaTeX) ou [@ (Pandoc)."
+        },
+        "quotely.projectPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the Quotely project root (set automatically by setup.sh)."
+        },
+        "quotely.suggestAtLineEnd": {
+          "type": "boolean",
+          "default": false,
+          "description": "Propose aussi une citation en texte fantôme en fin de ligne (sinon uniquement dans \\cite{ ou [@)."
+        },
+        "quotely.assistant.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analyse le paragraphe en cours et signale les phrases qu'un document de ta bibliothèque appuie (📚 à citer, 📝 déjà cité mais passage utile)."
+        },
+        "quotely.assistant.sensitivity": {
+          "type": "string",
+          "enum": [
+            "faible",
+            "normale",
+            "élevée"
+          ],
+          "default": "normale",
+          "description": "Nombre de suggestions : « faible » n'affiche que les correspondances très sûres."
+        },
+        "quotely.assistant.delay": {
+          "type": "number",
+          "default": 1200,
+          "description": "Délai (ms) après la dernière frappe avant d'analyser le paragraphe."
+        },
+        "quotely.onlineMetadata": {
+          "type": "boolean",
+          "default": false,
+          "description": "Complète titre, auteurs, année et revue via Crossref (DOI) et arXiv lors de l'indexation. Seul l'identifiant est envoyé ; les réponses sont gardées en cache dans data/db. Désactivé par défaut : Quotely reste alors entièrement hors ligne. Prend effet au prochain démarrage du backend."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "prepackage": "node scripts/copy-backend.js",
+    "package": "vsce package --no-dependencies",
+    "test": "npm run compile && node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}
