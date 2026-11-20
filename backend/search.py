@@ -1,143 +1,89 @@
 """
-Semantic search: bi-encoder retrieval + optional cross-encoder reranker.
-Both models use fastembed (ONNX) — no PyTorch, no GPU required.
+Two-stage retrieval: dense bi-encoder over the store, then a multilingual cross-encoder.
+
+N rows, d dim, n results, P = n·POOL_PER_RESULT candidate chunks, R = RERANK_TOP papers:
+  query embedding  O(L²) (one forward pass)
+  dense scan       O(N·d) + O(N) partial selection
+  grouping         O(P)
+  reranking        O(R · L²) cross-encoder passes, L ≤ RERANK_MAX_WORDS
 """
 from __future__ import annotations
 
 import math
 import re
 
-from ingest import get_collection, get_model
+import config
+import embeddings as embed
+from indexer import store
 from models import CitationResult
 
-_reranker = None          # TextCrossEncoder, loaded lazily
-_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-_RERANK_MAX_WORDS = 350
-_CHUNKS_PER_PAPER = 2
+_LATEX_RULES = [
+    (re.compile(r"\\(?:textbf|textit|emph|underline|text)\{([^}]+)\}"), r"\1"),
+    (re.compile(r"\\(?:cite[tp]?|ref|eqref|label|footnote)\{[^}]*\}"), ""),
+    (re.compile(r"\\(?:begin|end)\{[^}]+\}"), ""),
+    (re.compile(r"\\[a-zA-Z]+\*?\{[^}]*\}"), ""),
+    (re.compile(r"\\[a-zA-Z]+\*?"), ""),
+    (re.compile(r"\[@[^\]]*\]"), ""),
+    (re.compile(r"\s+"), " "),
+]
 
 
-def get_reranker():
-    global _reranker
-    if _reranker is None:
-        try:
-            from fastembed.rerank.cross_encoder import TextCrossEncoder  # lazy
-            print(f"[RagCite] Loading reranker ({_RERANKER_MODEL})...")
-            _reranker = TextCrossEncoder(_RERANKER_MODEL)
-            print("[RagCite] Reranker ready.")
-        except Exception as e:
-            print(f"[RagCite] Reranker unavailable ({e}), using bi-encoder only.")
-            _reranker = False  # sentinel: reranking disabled
-    return _reranker if _reranker is not False else None
-
-
-def _clean_query(text: str) -> str:
-    text = re.sub(r"\\(?:textbf|textit|emph|underline|text)\{([^}]+)\}", r"\1", text)
-    text = re.sub(r"\\(?:cite|ref|label|footnote)\{[^}]*\}", "", text)
-    text = re.sub(r"\\(?:begin|end)\{[^}]+\}", "", text)
-    text = re.sub(r"\\[a-zA-Z]+\*?\{[^}]*\}", "", text)
-    text = re.sub(r"\\[a-zA-Z]+\*?", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def clean_query(text: str) -> str:
+    for pattern, repl in _LATEX_RULES:
+        text = pattern.sub(repl, text)
+    return text.strip()
 
 
 def _truncate(text: str, max_words: int) -> str:
     words = text.split()
-    return " ".join(words[:max_words]) if len(words) > max_words else text
+    return " ".join(words[:max_words])
 
 
-def search(text: str, n: int = 5, workspace_path: str = "") -> list[CitationResult]:
-    """Two-stage retrieval: bi-encoder (ONNX) → optional cross-encoder reranker (ONNX)."""
-    model = get_model()
-    clean_text = _clean_query(text)
+def _sigmoid(x: float) -> float:
+    return 1 / (1 + math.exp(-x))
 
-    # fastembed: embed() returns a generator of numpy arrays
-    query_embedding = [next(model.embed([clean_text])).tolist()]
 
-    col = get_collection()
-    total = col.count()
-    if total == 0:
+def scopes(workspace_path: str) -> tuple[str, ...]:
+    return (workspace_path, str(config.DATA_PATH.resolve())) if workspace_path else ()
+
+
+def candidates(query: str, n: int, workspace_path: str = "") -> list[tuple[dict, float, str]]:
+    col = store()
+    hits = col.query(embed.embed_query(query), n * config.POOL_PER_RESULT, scopes(workspace_path))
+    papers: dict[str, list[tuple[int, float]]] = {}
+    for i, sim in hits:
+        group = papers.setdefault(col.metadatas[i]["bibtex_key"], [])
+        if len(group) < config.CHUNKS_PER_PAPER:
+            group.append((i, sim))
+    out = []
+    for group in papers.values():
+        first, sim = group[0]
+        context = " [...] ".join(col.documents[i] for i, _ in group)
+        out.append((col.metadatas[first], sim, context))
+    return out
+
+
+def search(text: str, n: int = 5, workspace_path: str = "", rerank: bool = True) -> list[CitationResult]:
+    query = clean_query(text)
+    if not query or store().count() == 0:
         return []
-
-    pool_size = min(n * 20, total)
-    results = col.query(
-        query_embeddings=query_embedding,
-        n_results=pool_size,
-        include=["metadatas", "distances", "documents"],
-    )
-
-    metadatas = results["metadatas"][0]
-    distances = results["distances"][0]
-    documents = results["documents"][0]
-
-    # Deduplicate: keep top-2 chunks per paper for richer reranker context
-    best: dict[str, list[tuple[dict, float, str]]] = {}
-    for meta, dist, doc in zip(metadatas, distances, documents):
-        key = meta["bibtex_key"]
-        if key not in best:
-            best[key] = []
-        if len(best[key]) < _CHUNKS_PER_PAPER:
-            best[key].append((meta, dist, doc))
-
-    unique_papers: list[tuple[dict, float, str]] = []
-    for chunks in best.values():
-        best_meta, best_dist, _ = chunks[0]
-        combined = " [...] ".join(c[2] for c in chunks)
-        combined = _truncate(combined, _RERANK_MAX_WORDS)
-        unique_papers.append((best_meta, best_dist, combined))
-
-    # Stage 2: rerank with cross-encoder (ONNX) if available
-    reranker = get_reranker()
-    if reranker is not None and len(unique_papers) >= 2:
-        try:
-            docs_for_rerank = [
-                f"{meta['title']}. {context}"
-                for meta, _, context in unique_papers
-            ]
-            raw = list(reranker.rerank(clean_text, docs_for_rerank))
-            # fastembed reranker returns objects with .score, or plain floats
-            if raw and hasattr(raw[0], "score"):
-                reranker_scores = [r.score for r in raw]
-            else:
-                reranker_scores = [float(r) for r in raw]
-
-            ranked = sorted(
-                zip(unique_papers, reranker_scores),
-                key=lambda x: x[1],
-                reverse=True,
-            )
-            unique_papers = [item for item, _ in ranked]
-            scores_norm = [round(1 / (1 + math.exp(-s)), 4) for _, s in ranked]
-        except Exception as e:
-            print(f"[RagCite] Reranker error ({e}), falling back to bi-encoder.")
-            unique_papers.sort(key=lambda x: x[1])
-            scores_norm = [round(max(0.0, 1.0 - dist), 4) for _, dist, _ in unique_papers]
-    else:
-        unique_papers.sort(key=lambda x: x[1])
-        scores_norm = [round(max(0.0, 1.0 - dist), 4) for _, dist, _ in unique_papers]
-
-    # Filter to workspace if provided
-    if workspace_path:
-        filtered = [
-            (paper, score)
-            for paper, score in zip(unique_papers, scores_norm)
-            if paper[0].get("file_path", "").startswith(workspace_path)
-        ]
-        if filtered:
-            unique_papers = [p for p, _ in filtered]
-            scores_norm = [s for _, s in filtered]
-
-    citations: list[CitationResult] = []
-    for (meta, _, _), score in zip(unique_papers[:n], scores_norm[:n]):
-        citations.append(
-            CitationResult(
-                bibtex_key=meta["bibtex_key"],
-                title=meta["title"],
-                authors=meta["authors"],
-                year=meta["year"],
-                score=score,
-                bibtex_entry=meta["bibtex_entry"],
-                file_path=meta.get("file_path", ""),
-            )
+    ranked = candidates(query, n, workspace_path)
+    scores = [max(0.0, s) for _, s, _ in ranked]
+    head = ranked[: config.RERANK_TOP]
+    raw = embed.rerank(query, [f"{m['title']}. {_truncate(c, config.RERANK_MAX_WORDS)}" for m, _, c in head]) if rerank else None
+    if raw is not None:
+        order = sorted(range(len(head)), key=lambda j: -raw[j])
+        ranked = [head[j] for j in order] + ranked[len(head):]
+        scores = [_sigmoid(raw[j]) for j in order] + [0.0] * (len(ranked) - len(head))
+    return [
+        CitationResult(
+            bibtex_key=m["bibtex_key"],
+            title=m["title"],
+            authors=m["authors"],
+            year=m["year"],
+            score=round(score, 4),
+            bibtex_entry=m["bibtex_entry"],
+            file_path=m["file_path"],
         )
-
-    return citations
+        for (m, _, _), score in zip(ranked[:n], scores[:n])
+    ]

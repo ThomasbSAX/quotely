@@ -1,84 +1,75 @@
 """
-Watchdog-based folder watcher: auto-ingests new files dropped anywhere under data/
-(subdirectories included, data/db/ excluded).
+Watches data/ recursively. Events are debounced per path (editors write files in several steps),
+then re-indexed or removed. Each event costs O(1) to queue; the work is the ingest cost.
 """
+from __future__ import annotations
+
 import threading
 import time
 from pathlib import Path
 
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from ingest import ingest_file, is_already_indexed, DATA_PATH, DB_PATH, get_collection
+import config
+import indexer
+from ingest import is_supported
 
-SUPPORTED_EXTENSIONS = {
-    ".pdf", ".tex", ".docx", ".doc",
-    ".md", ".txt",
-    ".pptx", ".ppt", ".odt", ".rtf",
-    ".xlsx", ".xls", ".csv",
-    ".ipynb",
-    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
-}
+DEBOUNCE_S = 1.5
 
 
-def _is_db_file(path: Path) -> bool:
-    """True if the file lives inside data/db/ (ChromaDB internal files)."""
-    try:
-        path.relative_to(DB_PATH)
-        return True
-    except ValueError:
-        return False
+class _Handler(FileSystemEventHandler):
+    def __init__(self) -> None:
+        self.pending: dict[Path, tuple[float, str]] = {}
+        self.cond = threading.Condition()
+        threading.Thread(target=self._drain, daemon=True).start()
 
-
-class PapersHandler(FileSystemEventHandler):
-    def on_created(self, event: FileCreatedEvent):
-        if event.is_directory:
+    def _push(self, path: str, action: str) -> None:
+        p = Path(path)
+        if not is_supported(p):
             return
-        path = Path(event.src_path)
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            return
-        if _is_db_file(path):
-            return
-        # Small delay to ensure file is fully written
-        time.sleep(0.5)
-        try:
-            if is_already_indexed(path):
-                print(f"[RagCite] Already indexed, skipping: {path.name}")
-                return
-            ingest_file(path)
-            get_collection().save()
-        except Exception as e:
-            print(f"[RagCite] Error ingesting {path.name}: {e}")
+        with self.cond:
+            self.pending[p] = (time.monotonic() + DEBOUNCE_S, action)
+            self.cond.notify()
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._push(event.src_path, "index")
+
+    on_modified = on_created
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._push(event.src_path, "remove")
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if not event.is_directory:
+            self._push(event.src_path, "remove")
+            self._push(event.dest_path, "index")
+
+    def _drain(self) -> None:
+        while True:
+            with self.cond:
+                while not self.pending:
+                    self.cond.wait()
+                now = time.monotonic()
+                ready = [(p, a) for p, (t, a) in self.pending.items() if t <= now]
+                for p, _ in ready:
+                    del self.pending[p]
+                if not ready:
+                    self.cond.wait(min(t for t, _ in self.pending.values()) - now)
+                    continue
+            for p, action in ready:
+                try:
+                    indexer.on_changed(p) if action == "index" else indexer.on_deleted(p)
+                except Exception as e:
+                    print(f"[Quotely] Watcher error on {p.name}: {e}")
 
 
 def start_watcher() -> Observer:
-    """Start watching data/ recursively in a background thread. Returns observer."""
-    DATA_PATH.mkdir(parents=True, exist_ok=True)
+    config.DATA_PATH.mkdir(parents=True, exist_ok=True)
     observer = Observer()
-    observer.schedule(PapersHandler(), str(DATA_PATH), recursive=True)
-    t = threading.Thread(target=observer.start, daemon=True)
-    t.start()
-    print(f"[RagCite] Watching {DATA_PATH} (recursive) for new documents...")
+    observer.daemon = True
+    observer.schedule(_Handler(), str(config.DATA_PATH), recursive=True)
+    observer.start()
     return observer
-
-
-def index_existing_papers():
-    """Index any files already under data/ (all subdirs) that aren't yet indexed."""
-    count = 0
-    for path in DATA_PATH.rglob("*"):
-        if path.is_dir():
-            continue
-        if _is_db_file(path):
-            continue
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        if is_already_indexed(path):
-            continue
-        try:
-            ingest_file(path)
-            count += 1
-        except Exception as e:
-            print(f"[RagCite] Failed to index {path.name}: {e}")
-    if count:
-        get_collection().save()
-        print(f"[RagCite] Startup indexing complete: {count} new document(s) added.")

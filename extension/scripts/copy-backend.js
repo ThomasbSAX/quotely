@@ -18,4 +18,6 @@ for (const file of files) {
   console.log(`  bundled: ${file}`);
 }
 
+fs.writeFileSync(path.join(DEST, "version.txt"), require("../package.json").version);
+
 console.log(`[Quotely] Backend bundle ready (${files.length} files) → ${DEST}`);

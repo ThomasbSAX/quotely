@@ -1,17 +1,17 @@
 """
-Document ingestion pipeline: PDF / TEX / DOCX / TXT / PPTX / XLSX / CSV / Images → VectorStore
+Document ingestion: extraction → metadata → section-aware chunking → embedding → store.
 
-Extraction layers:
-  1. .tex  → parse LaTeX source directly (perfect math, zero loss)
-  2. .pdf  → pymupdf4llm (markdown, multi-column, OCR fallback) + embedded-image OCR
-  3. others → dedicated parsers
+W = words in a document, C = chunks (≈ W / (CHUNK_WORDS − CHUNK_OVERLAP)), N = rows in store.
+  extraction      O(W) (+ OCR / PDF layout cost)
+  chunking        O(W)
+  embedding       O(C · L²) with L ≤ 512 tokens per chunk
+  replace in store O(N·d) only when a previously indexed file changed, else O(C·d)
 """
 from __future__ import annotations
 import csv
 import hashlib
 import io
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -19,17 +19,11 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
-# Force PyTorch to CPU — avoids SIGSEGV from MPS/Metal init on macOS 26 beta
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
+import config
+import embeddings as embed
 from vector_store import VectorStore
-# fitz, pymupdf4llm, docx imported lazily inside extraction functions
-# to avoid SIGSEGV on macOS 26 + Python 3.12 during module load
 
-# Optional OCR dependencies — checked lazily on first use to avoid C-extension
-# crashes at module load time (Pillow is a C extension)
-_ocr_available: bool | None = None  # None = not yet checked
+_ocr_available: bool | None = None
 
 
 def _is_ocr_available() -> bool:
@@ -38,56 +32,14 @@ def _is_ocr_available() -> bool:
         try:
             import pytesseract  # noqa: F401
             from PIL import Image  # noqa: F401
-            _ocr_available = True
+            _ocr_available = shutil.which("tesseract") is not None
         except ImportError:
             _ocr_available = False
     return _ocr_available
 
-# Optional PowerPoint / Excel
-try:
-    from pptx import Presentation
-    from pptx.enum.text import PP_ALIGN  # noqa: F401
-    PPTX_AVAILABLE = True
-except ImportError:
-    PPTX_AVAILABLE = False
 
-try:
-    import openpyxl
-    XLSX_AVAILABLE = True
-except ImportError:
-    XLSX_AVAILABLE = False
-
-# Shared singletons (imported by other modules)
-DB_PATH     = Path(__file__).parent.parent / "data" / "db"
-DATA_PATH   = Path(__file__).parent.parent / "data"        # watched root (all subdirs)
-PAPERS_PATH = DATA_PATH / "papers"                          # kept for backwards compat
-
-# LibreOffice path for legacy formats (.doc, .ppt, .odt, .rtf)
 _SOFFICE = shutil.which("soffice") or "/opt/homebrew/bin/soffice"
-LIBREOFFICE_AVAILABLE = Path(_SOFFICE).exists() if _SOFFICE else False
-
-_collection: VectorStore | None = None
-_model = None  # SentenceTransformer, loaded lazily on first use
-
-CHUNK_SIZE = 300   # tokens approx (we use words as proxy)
-CHUNK_OVERLAP = 50
-
-
-def get_collection() -> VectorStore:
-    global _collection
-    if _collection is None:
-        _collection = VectorStore(DB_PATH / "vectors.pkl")
-    return _collection
-
-
-def get_model():
-    global _model
-    if _model is None:
-        from fastembed import TextEmbedding  # lazy — ONNX, no PyTorch
-        print("[RagCite] Loading embedding model (first time ~15s)...")
-        _model = TextEmbedding("intfloat/multilingual-e5-small")
-        print("[RagCite] Model ready.")
-    return _model
+LIBREOFFICE_AVAILABLE = Path(_SOFFICE).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +189,7 @@ def _extract_txt(path: Path) -> tuple[str, dict]:
 
 
 def _extract_pptx(path: Path) -> tuple[str, dict]:
-    if not PPTX_AVAILABLE:
-        raise ImportError("python-pptx not installed. Run: pip install python-pptx")
+    from pptx import Presentation
     prs = Presentation(str(path))
     title = path.stem
     # Try to get title from first slide's title placeholder
@@ -268,8 +219,7 @@ def _extract_pptx(path: Path) -> tuple[str, dict]:
 
 
 def _extract_xlsx(path: Path) -> tuple[str, dict]:
-    if not XLSX_AVAILABLE:
-        raise ImportError("openpyxl not installed. Run: pip install openpyxl")
+    import openpyxl
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
     rows = []
     for ws in wb.worksheets:
@@ -370,9 +320,21 @@ def _fix_latex_encoding(text: str) -> str:
     return text
 
 
+_YEAR_RE = re.compile(r"(?<!\d)(19[5-9]\d|20\d{2})(?!\d)")
+_PDF_DATE_RE = re.compile(r"D:((?:19|20)\d{2})")
+
+
 def _extract_year(text: str) -> str:
-    m = re.search(r"\b(?:19|20)\d{2}\b", text)
-    return m.group(0) if m else "n.d."
+    import datetime
+
+    m = _PDF_DATE_RE.search(text)
+    if m:
+        return m.group(1)
+    limit = datetime.date.today().year + 1
+    for m in _YEAR_RE.finditer(text):
+        if int(m.group(1)) <= limit:
+            return m.group(1)
+    return "n.d."
 
 
 def _infer_author_from_path(path: Path) -> str:
@@ -479,183 +441,153 @@ def _make_bibtex_entry(key: str, title: str, authors: str, year: str, file_path:
 # Chunking
 # ---------------------------------------------------------------------------
 
+_SECTION_RE = re.compile(r"(?=^#{1,3} |^== .+ ==$)", re.MULTILINE)
+_CAPTION_RE = re.compile(r"\[Caption:[^\]]{10,}\]|\[Figure/Image\]:[^\n]{10,}")
+_HEADER_RE = re.compile(r"(#{1,3} [^\n]+|== [^\n]+ ==)")
+
+
 def _chunk_text(text: str) -> list[str]:
-    """Fallback: word-count chunking with overlap."""
     words = text.split()
+    step = config.CHUNK_WORDS - config.CHUNK_OVERLAP
     chunks = []
-    start = 0
-    while start < len(words):
-        end = start + CHUNK_SIZE
-        chunk = " ".join(words[start:end])
-        if chunk.strip():
-            chunks.append(chunk)
-        start = end - CHUNK_OVERLAP
-        if start >= len(words):
+    for start in range(0, len(words), step):
+        chunks.append(" ".join(words[start:start + config.CHUNK_WORDS]))
+        if start + config.CHUNK_WORDS >= len(words):
             break
     return chunks
 
 
 def _chunk_markdown(text: str) -> list[str]:
-    """
-    Section-aware chunking for markdown/structured text.
-    Splits on ## / ### headers, keeping each section as a unit.
-    Large sections are further split with overlap. Tiny sections are merged.
-    Figure captions are kept as standalone chunks for better retrieval.
-    """
-    # Split on markdown headers (## or ###) or LaTeX-style == Section ==
-    section_re = re.compile(r"(?=^#{1,3} |\n#{1,3} |^== .+ ==$|\n== .+ ==$)", re.MULTILINE)
-    parts = section_re.split(text)
-
     chunks: list[str] = []
-    buffer = ""
+    buffer: list[str] = []
+    buffered = 0
 
-    for part in parts:
+    def flush() -> None:
+        nonlocal buffer, buffered
+        if buffer:
+            chunks.append(" ".join(buffer))
+        buffer, buffered = [], 0
+
+    for part in _SECTION_RE.split(text):
         part = part.strip()
         if not part:
             continue
-
-        # Extract figure captions as dedicated chunks
-        captions = re.findall(r"\[Caption:[^\]]{10,}\]|\[Figure/Image\]:[^\n]{10,}", part)
-        for cap in captions:
-            if cap.strip():
-                chunks.append(cap.strip())
-
-        words = part.split()
-        if len(words) <= 20:
-            # Too short — accumulate in buffer
-            buffer += " " + part
-        elif len(words) <= CHUNK_SIZE:
-            combined = (buffer + " " + part).strip()
-            if len(combined.split()) > CHUNK_SIZE:
-                if buffer.strip():
-                    chunks.append(buffer.strip())
-                buffer = part
-            else:
-                buffer = combined
-        else:
-            # Flush buffer first
-            if buffer.strip():
-                chunks.append(buffer.strip())
-                buffer = ""
-            # Split large section with overlap, prefixed with section header
-            header_m = re.match(r"(#{1,3} [^\n]+|== [^\n]+ ==)", part)
-            header = header_m.group(0) + " — " if header_m else ""
-            sub = _chunk_text(part)
-            for s in sub:
-                chunks.append((header + s).strip())
-
-    if buffer.strip():
-        chunks.append(buffer.strip())
-
-    # Final filter: drop chunks that are pure whitespace or very short
-    return [c for c in chunks if len(c.split()) >= 8]
+        chunks.extend(c.strip() for c in _CAPTION_RE.findall(part))
+        n = len(part.split())
+        if n <= config.CHUNK_WORDS:
+            if buffered + n > config.CHUNK_WORDS:
+                flush()
+            buffer.append(part)
+            buffered += n
+            continue
+        flush()
+        header_m = _HEADER_RE.match(part)
+        header = header_m.group(0) + " — " if header_m else ""
+        chunks.extend(header + c for c in _chunk_text(part))
+    flush()
+    return [c for c in chunks if len(c.split()) >= config.MIN_CHUNK_WORDS]
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+_EXTRACTORS = {
+    ".pdf": (_extract_pdf, _chunk_markdown),
+    ".tex": (_extract_tex, _chunk_markdown),
+    ".docx": (_extract_docx, _chunk_text),
+    ".doc": (_extract_doc_via_libreoffice, _chunk_text),
+    ".odt": (_extract_doc_via_libreoffice, _chunk_text),
+    ".rtf": (_extract_doc_via_libreoffice, _chunk_text),
+    ".ppt": (_extract_doc_via_libreoffice, _chunk_text),
+    ".md": (_extract_txt, _chunk_markdown),
+    ".txt": (_extract_txt, _chunk_markdown),
+    ".pptx": (_extract_pptx, _chunk_text),
+    ".xlsx": (_extract_xlsx, _chunk_text),
+    ".xls": (_extract_xlsx, _chunk_text),
+    ".csv": (_extract_csv, _chunk_text),
+    ".ipynb": (_extract_ipynb, _chunk_markdown),
+    **{ext: (_extract_image, _chunk_text) for ext in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp")},
+}
+
+
 def file_hash(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for block in iter(lambda: f.read(65536), b""):
+        for block in iter(lambda: f.read(1 << 16), b""):
             h.update(block)
     return h.hexdigest()
 
 
-def is_already_indexed(path: Path) -> bool:
-    col = get_collection()
-    sha = file_hash(path)
-    results = col.get(where={"file_hash": sha}, limit=1)
-    return len(results["ids"]) > 0
+def is_supported(path: Path) -> bool:
+    return path.suffix.lower() in config.SUPPORTED_EXTENSIONS and not _in_db(path)
 
 
-def ingest_file(path: Path) -> dict:
-    """Parse, chunk, embed and store a document. Returns summary dict."""
-    path = Path(path)
-    suffix = path.suffix.lower()
+def _in_db(path: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(config.DB_PATH.resolve())
+        return True
+    except ValueError:
+        return False
 
-    if suffix == ".pdf":
-        text, meta = _extract_pdf(path)
-        chunks = _chunk_markdown(text)       # section-aware for structured markdown
-    elif suffix == ".tex":
-        text, meta = _extract_tex(path)
-        chunks = _chunk_markdown(text)       # LaTeX body is already structured
-    elif suffix == ".docx":
-        text, meta = _extract_docx(path)
-        chunks = _chunk_text(text)
-    elif suffix in (".doc", ".odt", ".rtf", ".ppt"):
-        text, meta = _extract_doc_via_libreoffice(path)
-        chunks = _chunk_text(text)
-    elif suffix in (".md", ".txt"):
-        text, meta = _extract_txt(path)
-        chunks = _chunk_markdown(text)
-    elif suffix == ".pptx":
-        text, meta = _extract_pptx(path)
-        chunks = _chunk_text(text)
-    elif suffix in (".xlsx", ".xls"):
-        text, meta = _extract_xlsx(path)
-        chunks = _chunk_text(text)
-    elif suffix == ".csv":
-        text, meta = _extract_csv(path)
-        chunks = _chunk_text(text)
-    elif suffix == ".ipynb":
-        text, meta = _extract_ipynb(path)
-        chunks = _chunk_markdown(text)
-    elif suffix in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
-        text, meta = _extract_image(path)
-        chunks = _chunk_text(text)
-    else:
-        raise ValueError(f"Unsupported format: {suffix}")
 
-    title = meta["title"] or path.stem
-    authors = meta["authors"]
-    year = meta["year"]
+def _unique_key(store: VectorStore, base: str, path: str) -> str:
+    key, n = base, 0
+    while store.key_owner(key) not in (None, path):
+        n += 1
+        key = base + chr(ord("a") + (n - 1) % 26) * (1 + (n - 1) // 26)
+    return key
 
-    # Fill missing author from path structure then from text content
-    if not authors:
-        authors = _infer_author_from_path(path) or _infer_author_from_text(text)
 
-    bibtex_key = _make_bibtex_key(authors, year, title)
-    bibtex_entry = _make_bibtex_entry(bibtex_key, title, authors, year, str(path))
-    sha = file_hash(path)
+def extract(path: Path) -> tuple[str, dict, list[str]]:
+    extractor, chunker = _EXTRACTORS[path.suffix.lower()]
+    text, meta = extractor(path)
+    return text, meta, chunker(text)
 
+
+def ingest_file(path: Path, store: VectorStore, sha: str | None = None) -> dict | None:
+    """Index `path` into `store`; returns None when the exact file content is already indexed."""
+    path = Path(path).resolve()
+    sha = sha or file_hash(path)
+    spath = str(path)
+    if store.path_hash(spath) == sha:
+        return None
+
+    text, meta, chunks = extract(path)
     if not chunks:
         raise ValueError("No text extracted from document.")
 
-    # Prepend a dedicated title chunk for direct title-based retrieval
+    title = re.sub(r"^[#*\s]+|[*\s]+$", "", meta["title"] or "") or path.stem
+    authors = meta["authors"] or _infer_author_from_path(path) or _infer_author_from_text(text)
+    year = meta["year"]
+
     title_chunk = title + (f" — {authors}" if authors else "")
-    all_chunks = [title_chunk] + chunks
+    documents = [title_chunk] + chunks
+    vectors = embed.embed_passages([title_chunk] + [f"{title}\n{c}" for c in chunks])
 
-    # Embed with title prefix so every chunk carries the article title →
-    # boosts retrieval when the query mentions title-related terms
-    embed_texts = [f"Titre: {title}\n{chunk}" for chunk in all_chunks]
+    with store.lock:
+        previous = store.key_for_path(spath)
+        store.delete_where("file_path", spath)
+        key = previous or _unique_key(store, _make_bibtex_key(authors, year, title), spath)
+        base_meta = {
+            "bibtex_key": key,
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "file_path": spath,
+            "file_hash": sha,
+            "bibtex_entry": _make_bibtex_entry(key, title, authors, year, spath),
+        }
+        store.upsert(
+            ids=[f"{sha[:16]}:{i}" for i in range(len(documents))],
+            embeddings=vectors,
+            documents=documents,
+            metadatas=[{**base_meta, "chunk_index": i - 1} for i in range(len(documents))],
+        )
 
-    model = get_model()
-    embeddings = [e.tolist() for e in model.embed(embed_texts, batch_size=256)]
+    print(f"[Quotely] Indexed '{title}' ({len(documents)} chunks) → {key}")
+    return {"bibtex_key": key, "title": title, "chunks_indexed": len(documents)}
 
-    col = get_collection()
-    # Title chunk → _title ID; content chunks → _chunk0, _chunk1, …
-    ids = [f"{bibtex_key}_title"] + [f"{bibtex_key}_chunk{i}" for i in range(len(chunks))]
-    base_meta = {
-        "bibtex_key": bibtex_key,
-        "title": title,
-        "authors": authors,
-        "year": year,
-        "file_path": str(path),
-        "bibtex_entry": bibtex_entry,
-        "file_hash": sha,
-    }
-    metadatas = [
-        {**base_meta, "chunk_index": -1},  # title chunk
-        *[{**base_meta, "chunk_index": i} for i in range(len(chunks))],
-    ]
 
-    col.upsert(ids=ids, embeddings=embeddings, documents=all_chunks, metadatas=metadatas)
-
-    print(f"[Quotely] Indexed '{title}' ({len(all_chunks)} chunks) → {bibtex_key}")
-    return {
-        "bibtex_key": bibtex_key,
-        "title": title,
-        "chunks_indexed": len(all_chunks),
-    }
+def remove_file(path: Path, store: VectorStore) -> int:
+    return store.delete_where("file_path", str(Path(path).resolve()))

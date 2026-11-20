@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the RagCite backend server
+# Start the Quotely backend server
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 unset PYTHONPATH
 cd "$ROOT/backend"

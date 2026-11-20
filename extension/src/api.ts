@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 
 const DEFAULT_URL = "http://127.0.0.1:7331";
+const CLIENT = { "X-Quotely-Client": "vscode" };
+const JSON_HEADERS = { ...CLIENT, "Content-Type": "application/json" };
 
 export interface CitationResult {
   bibtex_key: string;
@@ -37,7 +39,7 @@ export async function getSuggestions(
   const url = `${backendUrl()}/suggest`;
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_HEADERS,
     body: JSON.stringify({ text, n, workspace_path: workspacePath }),
     signal: AbortSignal.timeout(4000),
   });
@@ -50,7 +52,7 @@ export async function getSuggestions(
 
 export async function listPapers(): Promise<PaperInfo[]> {
   const url = `${backendUrl()}/papers`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
+  const res = await fetch(url, { headers: CLIENT, signal: AbortSignal.timeout(4000) });
   if (!res.ok) throw new Error(`Backend error ${res.status}`);
   return (await res.json()) as PaperInfo[];
 }
@@ -71,15 +73,36 @@ export async function searchDocuments(
   n: number = 20
 ): Promise<SearchResult[]> {
   const url = `${backendUrl()}/search?q=${encodeURIComponent(q)}&mode=${mode}&n=${n}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+  const res = await fetch(url, { headers: CLIENT, signal: AbortSignal.timeout(6000) });
   if (!res.ok) throw new Error(`Backend error ${res.status}`);
   const data = (await res.json()) as { results: SearchResult[] };
   return data.results;
 }
 
+export interface Health {
+  status: string;
+  version: string;
+  pid: number;
+  indexed_chunks: number;
+  indexing: { running: boolean; job: string; done: number; total: number };
+}
+
+export async function getHealth(): Promise<Health | null> {
+  try {
+    const res = await fetch(`${backendUrl()}/health`, {
+      headers: CLIENT,
+      signal: AbortSignal.timeout(1500),
+    });
+    return res.ok ? ((await res.json()) as Health) : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function checkHealth(): Promise<boolean> {
   try {
     const res = await fetch(`${backendUrl()}/health`, {
+      headers: CLIENT,
       signal: AbortSignal.timeout(1500),
     });
     return res.ok;
@@ -93,9 +116,9 @@ export async function ingestFolder(
 ): Promise<{ indexed: number; skipped: number; errors: string[] }> {
   const res = await fetch(`${backendUrl()}/ingest-folder`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_HEADERS,
     body: JSON.stringify({ path: folderPath }),
-    signal: AbortSignal.timeout(600000), // 10 min for large folders
+    signal: AbortSignal.timeout(600000),
   });
   if (!res.ok) throw new Error(`Backend error ${res.status}: ${await res.text()}`);
   return (await res.json()) as { indexed: number; skipped: number; errors: string[] };
@@ -104,9 +127,9 @@ export async function ingestFolder(
 export async function reindexAll(): Promise<{ total: number; errors: string[] }> {
   const res = await fetch(`${backendUrl()}/reindex`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: JSON_HEADERS,
     body: "{}",
-    signal: AbortSignal.timeout(600000), // 10 min
+    signal: AbortSignal.timeout(600000),
   });
   if (!res.ok) throw new Error(`Backend error ${res.status}: ${await res.text()}`);
   return (await res.json()) as { total: number; errors: string[] };

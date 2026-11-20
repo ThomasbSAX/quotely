@@ -21,3 +21,8 @@ extension/out/
 ## Legacy / misc
 lm-studio.txt
 Capture*
+
+## Build outputs
+extension/backend-bundle/
+extension/*.vsix
+.pytest_cache/

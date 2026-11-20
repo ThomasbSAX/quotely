@@ -14,7 +14,7 @@ It works fully offline. No API key, no internet, no data sent anywhere.
 
 Search for **Quotely** in the VS Code Marketplace, or install from the Extensions panel (`Cmd+Shift+X`).
 
-On first launch, Quotely installs its Python backend automatically (~5 minutes, one time only). You only need **Python 3.8+** on your machine.
+On first launch, Quotely installs its Python backend automatically (~5 minutes, one time only). You only need **Python 3.9+** on your machine.
 
 ---
 
@@ -51,13 +51,13 @@ PDF · LaTeX (.tex) · Word (.docx) · Markdown · PowerPoint (.pptx) · Excel �
 
 ## Multi-project support
 
-Each VS Code window stays scoped to its own workspace. Open three different research projects in three windows — each one only suggests papers from its own folder.
+Each VS Code window stays scoped to its own workspace. Open three different research projects in three windows — each one only suggests papers from its own folder, plus your shared library in `data/papers/`.
 
 ---
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.9 or higher
 - VS Code 1.85+
 - No GPU, no internet needed after setup
 
@@ -66,6 +66,21 @@ Each VS Code window stays scoped to its own workspace. Open three different rese
 ## Privacy
 
 Everything runs on your machine. Your documents, your embeddings, your data — none of it ever leaves your computer.
+
+---
+
+## Development
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+python -m pytest -q tests
+python main.py            # http://127.0.0.1:7331, every request needs the X-Quotely-Client header
+```
+
+Environment variables: `QUOTELY_HOME` (data root), `QUOTELY_PORT`, `QUOTELY_EMBED_MODEL`, `QUOTELY_EMBED_MODEL_PATH` (local ONNX export, e.g. a fine-tuned model), `QUOTELY_RERANKER`.
+
+The index lives in `data/db/index/` and is saved atomically. Bulk indexing checkpoints every 10 files; a full re-index is built in `data/db/staging/` and swapped in at the end, so an interrupted run resumes where it stopped on the next start.
 
 ---
 

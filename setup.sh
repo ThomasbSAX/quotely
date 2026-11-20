@@ -17,7 +17,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Python 3.10+
+# 1. Python 3.9+
 # ---------------------------------------------------------------------------
 PYTHON=""
 for cmd in python3 python; do
@@ -25,7 +25,7 @@ for cmd in python3 python; do
     PYVER=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
     MAJOR=$(echo "$PYVER" | cut -d. -f1)
     MINOR=$(echo "$PYVER" | cut -d. -f2)
-    if [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 10 ]; then
+    if [ "$MAJOR" -ge 3 ] && [ "$MINOR" -ge 9 ]; then
       PYTHON="$cmd"
       break
     fi
@@ -33,7 +33,7 @@ for cmd in python3 python; do
 done
 
 if [ -z "$PYTHON" ]; then
-  echo "[ERROR] Python 3.10+ not found."
+  echo "[ERROR] Python 3.9+ not found."
   echo "        Install from https://python.org and re-run this script."
   exit 1
 fi
@@ -60,11 +60,11 @@ echo "[...] Installing Python packages (first time: ~300 MB, a few minutes)..."
 echo "[OK] Python packages installed."
 
 # ---------------------------------------------------------------------------
-# 4. Pre-download embedding model (~90 MB, once)
+# 4. Pre-download models (embedding ~470 MB, reranker ~1.1 GB, once)
 # ---------------------------------------------------------------------------
-echo "[...] Downloading embedding model all-MiniLM-L6-v2 (~90 MB)..."
-"$PYBIN" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-echo "[OK] Embedding model ready."
+echo "[...] Downloading embedding and reranker models (once)..."
+(cd "$BACKEND" && "$PYBIN" -c "import embeddings as e; e.embedder(); e.reranker()")
+echo "[OK] Models ready."
 
 # ---------------------------------------------------------------------------
 # 5. Data directories

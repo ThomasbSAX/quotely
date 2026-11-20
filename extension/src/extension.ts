@@ -4,7 +4,7 @@ import * as os from "os";
 import * as cp from "child_process";
 import * as fs from "fs";
 import { CitationCompletionProvider, CitationHoverProvider } from "./provider";
-import { checkHealth, listPapers, getSuggestions, searchDocuments, ingestFolder, reindexAll } from "./api";
+import { checkHealth, getHealth, listPapers, getSuggestions, searchDocuments, ingestFolder, reindexAll } from "./api";
 import { QuotelyDecorationProvider } from "./decoration";
 import { CitationLinkProvider, updateCitationDecorations } from "./citationLinks";
 
@@ -431,8 +431,13 @@ export function deactivate() {
 async function startBackendIfOffline(projectPath: string): Promise<void> {
   if (!projectPath) return;
 
-  const healthy = await checkHealth();
-  if (healthy) return;
+  const expected = String(vscode.extensions.getExtension("quotely.quotely")?.packageJSON.version ?? "");
+  const health = await getHealth();
+  if (health && (!expected || health.version === expected || health.version === "dev")) return;
+  if (health?.pid) {
+    try { process.kill(health.pid); } catch { /* already gone */ }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 
   const isWin = process.platform === "win32";
   const pythonBin = isWin
@@ -656,15 +661,15 @@ async function ensureProjectPath(context: vscode.ExtensionContext): Promise<stri
   const config = vscode.workspace.getConfiguration("quotely");
   const configured = config.get<string>("projectPath") ?? "";
 
-  // Already configured and venv present → nothing to do
   if (configured && hasVenv(configured)) {
+    await syncBundledBackend(context, configured);
     return configured;
   }
 
-  // Check default install location (for users who ran setup.sh or a previous auto-setup)
   const defaultPath = path.join(os.homedir(), ".quotely");
   if (hasVenv(defaultPath)) {
     await config.update("projectPath", defaultPath, vscode.ConfigurationTarget.Global);
+    await syncBundledBackend(context, defaultPath);
     return defaultPath;
   }
 
@@ -699,9 +704,45 @@ async function ensureProjectPath(context: vscode.ExtensionContext): Promise<stri
     return installPath;
   } catch (e: any) {
     vscode.window.showErrorMessage(
-      `Quotely setup failed: ${e.message}\n\nMake sure Python 3.10+ is installed.`
+      `Quotely setup failed: ${e.message}\n\nMake sure Python 3.9+ is installed.`
     );
     return configured;
+  }
+}
+
+async function syncBundledBackend(context: vscode.ExtensionContext, installPath: string): Promise<void> {
+  const bundleSrc = path.join(context.extensionPath, "backend-bundle");
+  const backendDest = path.join(installPath, "backend");
+  const stamp = path.join(backendDest, ".bundle-version");
+  const version = String(context.extension.packageJSON.version);
+  if (!fs.existsSync(bundleSrc) || !fs.existsSync(path.join(backendDest, ".venv"))) return;
+  if (fs.existsSync(stamp) && fs.readFileSync(stamp, "utf8").trim() === version) return;
+
+  const oldReq = fs.existsSync(path.join(backendDest, "requirements.txt"))
+    ? fs.readFileSync(path.join(backendDest, "requirements.txt"), "utf8")
+    : "";
+  copyBundle(bundleSrc, backendDest);
+  const newReq = fs.readFileSync(path.join(backendDest, "requirements.txt"), "utf8");
+  if (newReq !== oldReq) {
+    const pip = process.platform === "win32"
+      ? path.join(backendDest, ".venv", "Scripts", "pip")
+      : path.join(backendDest, ".venv", "bin", "pip");
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Quotely: updating backend to ${version}…` },
+      () => spawnAsync(pip, ["install", "-r", "requirements.txt", "--quiet"], backendDest)
+    );
+  }
+  fs.writeFileSync(stamp, version);
+  if (backendProcess) {
+    backendProcess.kill();
+    backendProcess = null;
+  }
+}
+
+function copyBundle(src: string, dest: string): void {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const file of fs.readdirSync(src)) {
+    fs.copyFileSync(path.join(src, file), path.join(dest, file));
   }
 }
 
@@ -723,17 +764,12 @@ async function runFirstTimeSetup(
   fs.mkdirSync(path.join(installPath, "data", "papers"), { recursive: true });
   fs.mkdirSync(path.join(installPath, "data", "db"), { recursive: true });
 
-  // Copy bundled backend files (packed inside VSIX at install time)
   const bundleSrc = path.join(context.extensionPath, "backend-bundle");
-  if (fs.existsSync(bundleSrc)) {
-    for (const file of fs.readdirSync(bundleSrc)) {
-      fs.copyFileSync(path.join(bundleSrc, file), path.join(backendDest, file));
-    }
-  }
+  if (fs.existsSync(bundleSrc)) copyBundle(bundleSrc, backendDest);
 
   const python = await findPython();
   if (!python) {
-    throw new Error("Python 3.10+ not found. Install from https://python.org then reload VS Code.");
+    throw new Error("Python 3.9+ not found. Install from https://python.org then reload VS Code.");
   }
 
   await vscode.window.withProgress(
@@ -753,6 +789,7 @@ async function runFirstTimeSetup(
       progress.report({ message: "Installing packages (~300 MB, please wait)…" });
       await spawnAsync(pip, ["install", "--upgrade", "pip", "--quiet"], backendDest);
       await spawnAsync(pip, ["install", "-r", "requirements.txt", "--quiet"], backendDest);
+      fs.writeFileSync(path.join(backendDest, ".bundle-version"), String(context.extension.packageJSON.version));
     }
   );
 }
@@ -765,8 +802,7 @@ async function findPython(): Promise<string | null> {
   for (const cmd of candidates) {
     try {
       const out = await spawnAsync(cmd, ["--version"], ".", true);
-      // Accept Python 3.8+
-      if (/Python 3\.([89]|[1-9]\d)/.test(out)) return cmd;
+      if (/Python 3\.(9|[1-9]\d)/.test(out)) return cmd;
     } catch { /* try next */ }
   }
   return null;
